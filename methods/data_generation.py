@@ -199,24 +199,208 @@ def make_strike_grid(
 )-> None:    #np.ndarray:
 
     v0_centre = np.exp(norm_params[0,0])
-    print(v0_centre)
     sigma_ref = np.sqrt(v0_centre)
-    print(sigma_ref)
 
 
     T = maturities[:, None]                             #shape (6,1)
-    print(T)
     z = z_grid[None, :]                                 #shape (1,7)
-    print(z)
 
     K_centre = S_0 * np.exp(drift * T)                  # (6, 1)
-    print(K_centre)
     exponent = np.sqrt(T) * z * sigma_ref               # (6, 7) 
-    print(exponent)
     K = K_centre * np.exp(exponent)
-    print(K)
 
+    return K
+
+
+
+# ======================================================================
+# Euler-Maruyama time grid
+# ======================================================================
+def make_euler_grid(
+    maturities: np.ndarray,
+    steps_per_year: int = 2000,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    Construct the Euler-Maruyama time grid.
+
+    Returns
+    -------
+    time_grid:
+        Full Euler grid from 0 to the largest maturity.
+
+    dt:
+        Euler time-step size.
+
+    maturity_indices:
+        Indices of the requested maturities on the Euler grid.
+    """
+    
+    T_max = float(
+        np.max(maturities)
+    )
+
+    dt = 1.0 / steps_per_year
+
+    n_steps = int(
+        round(T_max * steps_per_year)
+    )
+
+    time_grid = (
+        np.arange(n_steps + 1) * dt
+    )
+
+    maturity_indices = np.rint(
+        maturities / dt
+    ).astype(int)
+
+    return (
+        time_grid,
+        dt,
+        maturity_indices,
+    )
+
+
+# ======================================================================
+# Generate correlated Brownian increments
+# ======================================================================
+RNG = np.random.default_rng(seed=42)
+
+def correlated_increments(
+    n_paths: int,
+    dt: float,
+    rho: np.ndarray,
+    rng: np.random.Generator = RNG,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generate correlated Brownian increments for one time step.
+
+    Each simulated path receives a price increment and a variance
+    increment. Different paths use independent random draws.(and each row in the tuple represents differnt path)
+
+    Parameters
+    ----------
+    n_paths : int
+        Number of paths simulated simultaneously. Must be positive.
+
+    sqrt_dt : float
+        Square root of the time-step length: sqrt(dt).
+        Scales standard normal draws into Brownian increments.
+        Must be positive.
+
+    rho : float
+        Correlation between the price and variance increments.
+        Mathematically valid between [-1, 1].
+        This project's prior restricts sampling to [-0.95, 0.10].
+
+    rng : np.random.Generator
+        NumPy random-number generator used to produce the draws.
+        Create it outside this function and reuse it across time steps.
+
+    Returns
+    -------
+    dW_S : np.ndarray
+        Brownian increments driving log-price, shape (n_paths,).
+        Each increment has mean zero and variance dt.
+
+    dW_v : np.ndarray
+        Brownian increments driving variance, shape (n_paths,).
+        Each increment has mean zero and variance dt.
+        Its correlation with the corresponding dW_S increment is rho.
+
+    Notes
+    -----
+    The stated moments and correlation describe the distribution.
+    A finite sample will only approximate them.
+    """
+    z = rng.standard_normal((n_paths, 2))
+
+    sqrt_dt = np.sqrt(dt)
+    
+    dW_S = sqrt_dt * z[:, 0]
+
+    #make sure that rho is between -1 and 1.
+    if not np.all((rho >= -1.0) & (rho <= 1.0)):
+        raise ValueError("Every rho value must be between -1 and 1.")
+
+    dW_v = sqrt_dt * (
+        rho * z[:, 0]
+        + np.sqrt(1.0 - rho ** 2) * z[:, 1]
+    )
+
+    return dW_S, dW_v
+
+
+# ======================================================================
+# Underlying(S_t) and variance(v_t) step function
+# ======================================================================
+def und_and_var_step(
+    x: np.ndarray,
+    v: np.ndarray,
+    kappa: np.ndarray,
+    theta: np.ndarray,
+    xi: np.ndarray,
+    drift: float,
+    dt: float,
+    dW_S: np.ndarray,
+    dW_v: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Advance all Heston paths by one full-truncation Euler step.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Current log-prices, shape (n_paths,): x = log(S).
+    v : np.ndarray
+        Current raw numerical variance states, shape (n_paths,).
+        These may become negative under the discretisation.
+    kappa : np.ndarray
+        Mean-reversion speeds, shape (n_paths,).
+    theta : np.ndarray
+        Long-run variance levels, shape (n_paths,).
+    xi : np.ndarray
+        Volatility-of-variance coefficients, shape (n_paths,).
+    drift : float
+        Shared underlying-price drift.
+        For risk-neutral pricing, use interest rate minus dividend yield.
+    dt : float
+        Time-step length, using the same time units as the parameters.
+    dW_S : np.ndarray
+        Price Brownian increments, shape (n_paths,).
+        Already include the sqrt(dt) scaling.
+    dW_v : np.ndarray
+        Variance Brownian increments, shape (n_paths,).
+        Already include the sqrt(dt) scaling.
+
+    Returns
+    -------
+    x_next : np.ndarray
+        Updated log-prices, shape (n_paths,).
+    v_next : np.ndarray
+        Updated raw numerical variance states, shape (n_paths,).
+    """
+    # Use nonnegative variance in both drift and diffusion coefficients.
+    v_positive = np.maximum(v, 0.0)
+
+    # Convert effective variance into volatility.
+    sqrt_v = np.sqrt(v_positive)
+
+    # Update log-price using the current variance and price increment.
+    x_next = (
+        x
+        + (drift - 0.5 * v_positive) * dt
+        + sqrt_v * dW_S
+    )
+
+    # Update variance using that SAME current variance.
+    # Retain raw v in the first term: this is full-truncation Euler.
+    v_next = (
+        v
+        + kappa * (theta - v_positive) * dt
+        + xi * sqrt_v * dW_v
+    )
+
+    return x_next, v_next
 
 if __name__ == "__main__":
-    make_prior_spec()
-    make_strike_grid(maturities= MATURITIES, z_grid= Z_GRID, )
+    
